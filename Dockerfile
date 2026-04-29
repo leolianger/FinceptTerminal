@@ -129,13 +129,24 @@ RUN . /etc/build.env \
 ENV QT_ROOT=/opt/Qt
 RUN . /etc/build.env \
     && pip3 install --break-system-packages --no-cache-dir aqtinstall \
+    && ok=0 \
     && for attempt in 1 2 3 4 5; do \
-         python3 -m aqt install-qt linux desktop "${QT_VERSION}" "${QT_ARCH_AQT}" \
-           --outputdir "${QT_ROOT}" \
-           --modules qtcharts qtwebsockets qtmultimedia \
-         && break \
-         || { echo "aqtinstall attempt ${attempt} failed, retrying in 5s..."; sleep 5; }; \
-       done
+         if python3 -m aqt install-qt linux desktop "${QT_VERSION}" "${QT_ARCH_AQT}" \
+              --outputdir "${QT_ROOT}" \
+              --modules qtcharts qtwebsockets qtmultimedia; then \
+           ok=1; break; \
+         fi; \
+         echo "aqtinstall attempt ${attempt} failed, retrying in 5s..."; sleep 5; \
+       done \
+    && [ "$ok" = "1" ] || { echo "aqtinstall failed after 5 attempts" >&2; exit 1; } \
+    && echo "== Qt install layout ==" \
+    && ls -la "${QT_ROOT}/${QT_VERSION}/" \
+    && QT_ACTUAL_PATH="$(ls -d ${QT_ROOT}/${QT_VERSION}/*/ 2>/dev/null | grep -E '/(gcc_(64|arm64)|linux_gcc_(64|arm64))/$' | head -n1)" \
+    && [ -n "$QT_ACTUAL_PATH" ] || { echo "could not find Qt arch dir under ${QT_ROOT}/${QT_VERSION}" >&2; exit 1; } \
+    && QT_ACTUAL_PATH="${QT_ACTUAL_PATH%/}" \
+    && QT_ACTUAL_BASENAME="$(basename "$QT_ACTUAL_PATH")" \
+    && echo "QT_ARCH_PATH_RESOLVED=${QT_ACTUAL_BASENAME}" >> /etc/build.env \
+    && cat /etc/build.env
 
 # ── Build Fincept Terminal ───────────────────────────────────────────────────
 WORKDIR /src
@@ -143,7 +154,10 @@ COPY fincept-qt/ ./fincept-qt/
 
 WORKDIR /src/fincept-qt
 RUN . /etc/build.env \
-    && export CMAKE_PREFIX_PATH="${QT_ROOT}/${QT_VERSION}/${QT_ARCH_PATH}" \
+    && QT_DIR_NAME="${QT_ARCH_PATH_RESOLVED:-$QT_ARCH_PATH}" \
+    && export CMAKE_PREFIX_PATH="${QT_ROOT}/${QT_VERSION}/${QT_DIR_NAME}" \
+    && [ -f "${CMAKE_PREFIX_PATH}/lib/cmake/Qt6/Qt6Config.cmake" ] \
+         || { echo "Qt6Config.cmake not found under ${CMAKE_PREFIX_PATH}" >&2; ls -la "${QT_ROOT}/${QT_VERSION}" || true; exit 1; } \
     && export PATH="${CMAKE_PREFIX_PATH}/bin:${PATH}" \
     && rm -rf build \
     && cmake -B build -G Ninja \
@@ -196,20 +210,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Resolve the on-disk Qt arch path for this target. Same mapping as builder.
-RUN set -eux; \
-    case "${TARGETARCH}" in \
-      amd64) echo "gcc_64"   > /etc/qt_arch ;; \
-      arm64) echo "gcc_arm64" > /etc/qt_arch ;; \
-      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac
-
 ENV QT_ROOT=/opt/Qt
 
 # Bundle Qt 6.8.3 libs + plugins from builder stage. The builder writes under
 # /opt/Qt/${QT_VERSION}/${arch-dependent}/ — the whole /opt/Qt tree copies
 # cleanly for either arch, since only one kit is installed per build.
 COPY --from=builder /opt/Qt /opt/Qt
+
+# Resolve the actual on-disk Qt arch dir (handles aqtinstall version drift
+# between gcc_64 / gcc_arm64 / linux_gcc_64 / linux_gcc_arm64). Run AFTER the
+# Qt tree is copied so we can probe the real layout.
+RUN set -eux; \
+    QT_ACTUAL_PATH="$(ls -d ${QT_ROOT:-/opt/Qt}/${QT_VERSION}/*/ 2>/dev/null \
+                      | grep -E '/(gcc_(64|arm64)|linux_gcc_(64|arm64))/$' | head -n1)"; \
+    [ -n "$QT_ACTUAL_PATH" ] || { echo "no Qt arch dir under /opt/Qt/${QT_VERSION}" >&2; exit 1; }; \
+    QT_ACTUAL_PATH="${QT_ACTUAL_PATH%/}"; \
+    basename "$QT_ACTUAL_PATH" > /etc/qt_arch; \
+    cat /etc/qt_arch
 
 # LD_LIBRARY_PATH / QT_PLUGIN_PATH / QT_QPA_PLATFORM_PLUGIN_PATH are resolved
 # at container start by the ENTRYPOINT wrapper so they pick up the correct
