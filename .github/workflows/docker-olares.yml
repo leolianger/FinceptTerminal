@@ -1,13 +1,17 @@
-# Build the repo-root Dockerfile and push a multi-arch image to Docker Hub.
-# Then build a thin Olares-flavored image (Xvfb + noVNC) on top, also multi-arch.
-# Both pushed to Docker Hub. Olares chart consumes <user>/finceptterminal-olares.
+# Build the upstream Dockerfile per-arch on native runners, push by digest,
+# then merge the digests into a single multi-arch manifest. Repeat for the
+# Olares wrapper image.
+#
+# Why per-arch native runners (not buildx + QEMU)?
+#   The upstream Dockerfile pins its builder stage to $BUILDPLATFORM and
+#   installs aarch64 toolchain binaries inside it — i.e. it expects the host
+#   arch to MATCH the target arch (it is NOT a cross-compile setup). Using
+#   QEMU + --platform from a single amd64 runner therefore fails with
+#   "Could not open /lib/ld-linux-aarch64.so.1". Native runners side-step that.
 #
 # Bump DOCKER_IMAGE_TAG below to publish a new image. Workflow pushes only the
 # explicit tag (no `latest`, no commit-sha tag) so Olares charts always point
 # at a known immutable build.
-#
-# Multi-platform: linux/amd64, linux/arm64.
-# Triggers: pushes to main, manual dispatch, tag pushes (v*).
 #
 # Required repo secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
 
@@ -40,14 +44,30 @@ env:
   OLARES_IMAGE_NAME: finceptterminal-olares
 
 jobs:
+  # ────────────────────────────────────────────────────────────────────────
+  # Stage 1: build base image, one job per arch on a native runner.
+  #          Push by digest; do NOT tag yet — manifest job tags both.
+  # ────────────────────────────────────────────────────────────────────────
   base:
-    name: Build base image (Qt runtime)
-    runs-on: ubuntu-22.04
+    name: Build base (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-22.04
+            arch_short: amd64
+          - platform: linux/arm64
+            runner: ubuntu-22.04-arm
+            arch_short: arm64
     permissions:
       contents: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      digest_amd64: ${{ steps.export.outputs.digest_amd64 }}
+      digest_arm64: ${{ steps.export.outputs.digest_arm64 }}
 
     steps:
       - name: Checkout code
@@ -55,6 +75,7 @@ jobs:
 
       - name: Resolve image tag
         id: tag
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG="${GITHUB_REF#refs/tags/v}"
@@ -67,16 +88,12 @@ jobs:
           echo "Resolved tag: ${TAG}"
 
       - name: Free up runner disk space
+        shell: bash
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /opt/hostedtoolcache/CodeQL || true
           docker system prune -af || true
           df -h
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -87,24 +104,106 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push base image
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
+          platforms: ${{ matrix.platform }}
           provenance: false
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
-          cache-from: type=gha,scope=finceptterminal-base
-          cache-to: type=gha,mode=max,scope=finceptterminal-base
+          # Push by digest only — no tag, manifest step will tag both digests.
+          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=finceptterminal-base-${{ matrix.arch_short }}
+          cache-to: type=gha,mode=max,scope=finceptterminal-base-${{ matrix.arch_short }}
 
-  olares:
-    name: Build Olares image (noVNC wrapper)
+      - name: Export digest
+        id: export
+        shell: bash
+        run: |
+          mkdir -p /tmp/digests
+          DIGEST="${{ steps.build.outputs.digest }}"
+          echo "Digest for ${{ matrix.platform }}: $DIGEST"
+          # Pass arch-specific digest forward via job outputs.
+          if [ "${{ matrix.arch_short }}" = "amd64" ]; then
+            echo "digest_amd64=$DIGEST" >> "$GITHUB_OUTPUT"
+          else
+            echo "digest_arm64=$DIGEST" >> "$GITHUB_OUTPUT"
+          fi
+          # Save artifact too, so the merge job can read both digests reliably.
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-base-${{ matrix.arch_short }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Stage 2: merge per-arch base digests into a single multi-arch tag.
+  # ────────────────────────────────────────────────────────────────────────
+  base-manifest:
+    name: Merge base manifest
     needs: base
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ needs.base.outputs.tag }}
+
+    steps:
+      - name: Download digest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-base-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        shell: bash
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.base.outputs.tag }}"
+          IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
+          REFS=()
+          for f in *; do
+            REFS+=("${IMAGE}@sha256:${f}")
+          done
+          echo "Creating manifest ${IMAGE}:${TAG} from: ${REFS[*]}"
+          docker buildx imagetools create -t "${IMAGE}:${TAG}" "${REFS[@]}"
+          docker buildx imagetools inspect "${IMAGE}:${TAG}"
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Stage 3: Olares wrapper image. Per-arch native build using base:tag as
+  # ARG BASE_IMAGE. Push by digest, merge in next job.
+  # ────────────────────────────────────────────────────────────────────────
+  olares:
+    name: Build Olares (${{ matrix.platform }})
+    needs: base-manifest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-22.04
+            arch_short: amd64
+          - platform: linux/arm64
+            runner: ubuntu-22.04-arm
+            arch_short: arm64
     permissions:
       contents: read
 
@@ -112,10 +211,60 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
         with:
-          platforms: arm64
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Olares image by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.olares
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          build-args: |
+            BASE_IMAGE=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.base-manifest.outputs.tag }}
+          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.OLARES_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=finceptterminal-olares-${{ matrix.arch_short }}
+          cache-to: type=gha,mode=max,scope=finceptterminal-olares-${{ matrix.arch_short }}
+
+      - name: Export digest
+        shell: bash
+        run: |
+          mkdir -p /tmp/digests
+          DIGEST="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-olares-${{ matrix.arch_short }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  olares-manifest:
+    name: Merge Olares manifest
+    needs:
+      - base-manifest
+      - olares
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download digest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-olares-*
+          merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -126,17 +275,17 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push Olares image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.olares
-          platforms: linux/amd64,linux/arm64
-          push: true
-          provenance: false
-          build-args: |
-            BASE_IMAGE=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.base.outputs.tag }}
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.OLARES_IMAGE_NAME }}:${{ needs.base.outputs.tag }}
-          cache-from: type=gha,scope=finceptterminal-olares
-          cache-to: type=gha,mode=max,scope=finceptterminal-olares
+      - name: Create multi-arch manifest
+        shell: bash
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.base-manifest.outputs.tag }}"
+          IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.OLARES_IMAGE_NAME }}"
+          REFS=()
+          for f in *; do
+            REFS+=("${IMAGE}@sha256:${f}")
+          done
+          echo "Creating manifest ${IMAGE}:${TAG} from: ${REFS[*]}"
+          docker buildx imagetools create -t "${IMAGE}:${TAG}" "${REFS[@]}"
+          docker buildx imagetools inspect "${IMAGE}:${TAG}"
