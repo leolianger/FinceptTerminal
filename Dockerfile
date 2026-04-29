@@ -62,11 +62,13 @@ ARG CMAKE_VERSION=3.27.7
 RUN set -eux; \
     case "${TARGETARCH}" in \
       amd64) \
+        QT_HOST_AQT=linux; \
         QT_ARCH_AQT=linux_gcc_64; \
         QT_ARCH_PATH=gcc_64; \
         CMAKE_ASSET="cmake-${CMAKE_VERSION}-linux-x86_64.sh"; \
         ;; \
       arm64) \
+        QT_HOST_AQT=linux_arm64; \
         QT_ARCH_AQT=linux_gcc_arm64; \
         QT_ARCH_PATH=gcc_arm64; \
         CMAKE_ASSET="cmake-${CMAKE_VERSION}-linux-aarch64.sh"; \
@@ -74,6 +76,7 @@ RUN set -eux; \
       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     { \
+      echo "QT_HOST_AQT=${QT_HOST_AQT}"; \
       echo "QT_ARCH_AQT=${QT_ARCH_AQT}"; \
       echo "QT_ARCH_PATH=${QT_ARCH_PATH}"; \
       echo "CMAKE_ASSET=${CMAKE_ASSET}"; \
@@ -131,7 +134,7 @@ RUN . /etc/build.env \
     && pip3 install --break-system-packages --no-cache-dir aqtinstall \
     && ok=0 \
     && for attempt in 1 2 3 4 5; do \
-         if python3 -m aqt install-qt linux desktop "${QT_VERSION}" "${QT_ARCH_AQT}" \
+         if python3 -m aqt install-qt "${QT_HOST_AQT}" desktop "${QT_VERSION}" "${QT_ARCH_AQT}" \
               --outputdir "${QT_ROOT}" \
               --modules qtcharts qtwebsockets qtmultimedia; then \
            ok=1; break; \
